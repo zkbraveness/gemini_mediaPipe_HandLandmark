@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 隔空手势写字系统</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #1e1e1e; font-family: sans-serif; }
+        
+        /* 视频层：隐藏，但需要存在以供处理 */
+        #input_video { display: none; }
+        
+        /* 画布层：全屏显示 */
+        #output_canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            z-index: 1;
+            transform: scaleX(-1); /* 镜像显示，符合直觉 */
+        }
+
+        /* UI 面板层：不镜像，因为文字需要正向显示 */
+        #ui_layer {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            z-index: 2;
+            pointer-events: none; /* 让鼠标事件穿透，我们用手势控制 */
+            display: none; /* 默认隐藏 */
+        }
+
+        .panel {
+            position: absolute;
+            bottom: 20px;  /* 距离底部20px */
+            right: 20px;   /* 距离右侧20px */
+            transform: none; /* 移除居中的平移变换 */
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            pointer-events: auto;
+            width: 400px;
+        }
+
+        .panel h2 { margin: 0 0 10px 0; text-align: center; color: #333; }
+        
+        .control-group { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+        
+        .btn {
+            border: 2px solid #ccc;
+            border-radius: 8px;
+            padding: 10px 15px;
+            background: #fff;
+            font-weight: bold;
+            transition: 0.3s;
+        }
+        
+        .btn.active { border-color: #007bff; background: #e7f1ff; transform: scale(1.1); }
+        
+        .color-btn { width: 30px; height: 30px; border-radius: 50%; border: 2px solid #ddd; }
+        
+        /* 虚拟光标 */
+        #cursor {
+            position: absolute;
+            width: 20px; height: 20px;
+            background: rgba(255, 0, 0, 0.5);
+            border: 2px solid white;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+            display: none;
+            pointer-events: none;
+        }
+
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-size: 24px; z-index: 100;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">正在加载模型，请稍候...<br><small>请确保允许摄像头权限</small></div>
+
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="cursor"></div>
+
+    <div id="ui_layer">
+        <div class="panel" id="settings_panel">
+            <h2>工具箱</h2>
+            
+            <div class="control-group">
+                <div class="btn active" id="tool_pen" data-type="tool" data-val="pen">🖊️ 笔</div>
+                <div class="btn" id="tool_eraser" data-type="tool" data-val="eraser">🧽 橡皮</div>
+            </div>
+
+            <div class="control-group">
+                <div class="btn color-btn active" style="background: #ff0000;" data-type="color" data-val="#ff0000"></div>
+                <div class="btn color-btn" style="background: #00ff00;" data-type="color" data-val="#00ff00"></div>
+                <div class="btn color-btn" style="background: #0000ff;" data-type="color" data-val="#0000ff"></div>
+                <div class="btn color-btn" style="background: #ffffff;" data-type="color" data-val="#ffffff"></div>
+                <div class="btn color-btn" style="background: #ffff00;" data-type="color" data-val="#ffff00"></div>
+            </div>
+
+            <div class="control-group">
+                <div class="btn" data-type="size" data-val="5">细</div>
+                <div class="btn active" data-type="size" data-val="10">中</div>
+                <div class="btn" data-type="size" data-val="20">粗</div>
+                <div class="btn" data-type="size" data-val="40">特粗</div>
+            </div>
+            
+            <p style="text-align:center; color:#666; font-size: 12px;">张开手掌退出</p>
+        </div>
+    </div>
+
+<script>
+    // --- 变量初始化 ---
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const uiLayer = document.getElementById('ui_layer');
+    const cursor = document.getElementById('cursor');
+    const panel = document.getElementById('settings_panel');
+    const loadingDiv = document.getElementById('loading');
+
+    // 状态管理
+    let state = {
+        isMenuOpen: false,
+        tool: 'pen', // 'pen' or 'eraser'
+        color: '#ff0000',
+        lineWidth: 10,
+        globalScale: 1.0,
+        lastPinchDistance: null, // 用于缩放
+        menuCooldown: 0 // 防止菜单频繁开关
+    };
+
+    // 绘画数据
+    let paths = []; // 存储所有笔画: [{points: [{x, y}], color, width}]
+    let currentPath = [];
+    let particles = []; // 雪花粒子
+
+    // 设置画布尺寸
+    function resizeCanvas() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- MediaPipe 设置 ---
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+    camera.start();
+
+    // --- 核心逻辑循环 ---
+    function onResults(results) {
+        loadingDiv.style.display = 'none';
+        
+        // 1. 清空和绘制摄像头背景 (镜像处理在CSS中做了，这里绘制原始图像)
+        // 注意：因为CSS flip了canvas，所以我们画图时逻辑坐标要是正常的
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        // 绘制摄像头画面（可选，如果想看实景）
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        // 绘制已有的笔画
+        drawPaths(canvasCtx);
+        
+        // 绘制雪花
+        updateAndDrawParticles(canvasCtx);
+
+        // 处理手势
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handleGestures(results.multiHandLandmarks);
+        } else {
+            // 没有手的时候，结束当前笔画
+            if(currentPath.length > 0) {
+                paths.push({
+                    points: currentPath,
+                    color: state.tool === 'eraser' ? 'global-eraser' : state.color, // 标记橡皮擦
+                    width: state.lineWidth,
+                    isEraser: state.tool === 'eraser'
+                });
+                currentPath = [];
+            }
+            state.lastPinchDistance = null;
+        }
+        
+        canvasCtx.restore();
+        
+        // 更新冷却时间
+        if(state.menuCooldown > 0) state.menuCooldown--;
+    }
+
+    // --- 手势处理逻辑 ---
+    function handleGestures(landmarksList) {
+        const width = canvasElement.width;
+        const height = canvasElement.height;
+
+        // --- 场景 1: 双手操作 (缩放) ---
+        if (landmarksList.length === 2) {
+            // 两个食指指尖 (Index Tip is index 8)
+            const h1 = landmarksList[0][8];
+            const h2 = landmarksList[1][8];
+            
+            // 简单判断：如果两只手都是食指伸出（这里简化，只检查是否都有手）
+            // 计算两点距离
+            const dist = Math.hypot(h1.x - h2.x, h1.y - h2.y);
+            
+            if (state.lastPinchDistance != null) {
+                const delta = dist - state.lastPinchDistance;
+                // 调整全局缩放
+                state.globalScale += delta * 2; 
+                state.globalScale = Math.max(0.1, Math.min(state.globalScale, 5.0));
+            }
+            state.lastPinchDistance = dist;
+            
+            // 双手时不写字
+            currentPath = [];
+            return; 
+        } else {
+            state.lastPinchDistance = null;
+        }
+
+        // --- 场景 2: 单手操作 ---
+        const lm = landmarksList[0]; // 只取第一只手
+
+        // 关键点坐标
+        const indexTip = { x: lm[8].x * width, y: lm[8].y * height };
+        const thumbTip = { x: lm[4].x * width, y: lm[4].y * height };
+        const middleTip = { x: lm[12].x * width, y: lm[12].y * height };
+
+        // 1. 检测手掌张开 (Open Palm) -> 切换菜单
+        if (isPalmOpen(lm) && state.menuCooldown === 0) {
+            toggleMenu();
+            state.menuCooldown = 30; // 冷却大约 1 秒
+            return;
+        }
+
+        // 2. 如果菜单打开，处理 UI 交互
+        if (state.isMenuOpen) {
+            // 在 UI 模式下，不写字，显示光标
+            // 注意：Canvas被CSS翻转了，但DOM元素(UI)没有翻转。
+            // 这里的 indexTip 是基于 Canvas 坐标的 (0,0 在左上，但显示是镜像的)。
+            // 为了让光标跟手对齐，我们需要反转 X 坐标来匹配非镜像的 UI 层 DOM 坐标。
+            const uiX = width - indexTip.x; 
+            const uiY = indexTip.y;
+
+            cursor.style.display = 'block';
+            cursor.style.left = uiX + 'px';
+            cursor.style.top = uiY + 'px';
+
+            checkUICollision(uiX, uiY);
+            return;
+        } else {
+            cursor.style.display = 'none';
+        }
+
+        // 3. 检测 "剪刀手/胜利" (Peace) -> 触发雪花消散
+        if (isVictorySign(lm)) {
+            triggerSnowEffect();
+            return;
+        }
+
+        // 4. 检测 "捏合" (Pinch) -> 写字
+        const pinchDist = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
+        if (pinchDist < 0.05) {
+            // 正在写字
+            // 计算中点作为笔触位置
+            const drawX = (indexTip.x + thumbTip.x) / 2;
+            const drawY = (indexTip.y + thumbTip.y) / 2;
+            
+            // 应用反向缩放逻辑，使得字是记录在绝对空间里的
+            // 简单起见，我们记录当前屏幕坐标，渲染时应用缩放中心变化比较复杂。
+            // 这里我们采用简化方案：直接记录坐标，缩放时改变 Canvas transform。
+            // 为了支持缩放后还能在正确位置继续写，需要将当前坐标转换为“世界坐标”。
+            // 但为保持代码单文件简洁，我们实现一个 基于中心点的简单缩放渲染。
+            // 所以存储时存储 原始坐标 / globalScale。
+            
+            // 修正：更简单的缩放逻辑是只在渲染时 scale，写字时记录相对中心的偏移
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const worldX = (drawX - centerX) / state.globalScale + centerX;
+            const worldY = (drawY - centerY) / state.globalScale + centerY;
+
+            currentPath.push({ x: worldX, y: worldY });
+        } else {
+            // 抬起笔
+            if (currentPath.length > 0) {
+                paths.push({
+                    points: currentPath,
+                    color: state.tool === 'eraser' ? '#000000' : state.color, // 橡皮擦逻辑稍后处理
+                    width: state.lineWidth,
+                    isEraser: state.tool === 'eraser'
+                });
+                currentPath = [];
+            }
+        }
+    }
+
+    // --- 辅助算法 ---
+
+    // 判断手掌张开 (所有手指伸直)
+    function isPalmOpen(lm) {
+        // 简单判断：指尖 y 小于 指关节 y (假设手向上) 或者根据距离判断
+        // 这里用手指伸直判断：指尖到掌心距离 > 指关节到掌心距离
+        const wrist = lm[0];
+        const tips = [8, 12, 16, 20];
+        const pips = [6, 10, 14, 18];
+        
+        let openCount = 0;
+        for (let i = 0; i < tips.length; i++) {
+            if (dist(lm[tips[i]], wrist) > dist(lm[pips[i]], wrist)) {
+                openCount++;
+            }
+        }
+        // 拇指单独判断
+        if (dist(lm[4], lm[17]) > dist(lm[3], lm[17])) openCount++;
+
+        return openCount === 5;
+    }
+
+    // 判断胜利手势 (食指中指伸直，无名指小指弯曲)
+    function isVictorySign(lm) {
+        const wrist = lm[0];
+        const indexOpen = dist(lm[8], wrist) > dist(lm[6], wrist);
+        const middleOpen = dist(lm[12], wrist) > dist(lm[10], wrist);
+        const ringClosed = dist(lm[16], wrist) < dist(lm[14], wrist);
+        const pinkyClosed = dist(lm[20], wrist) < dist(lm[18], wrist);
+
+        return indexOpen && middleOpen && ringClosed && pinkyClosed;
+    }
+
+    function dist(p1, p2) {
+        return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+    }
+
+    // --- UI 交互 ---
+    function toggleMenu() {
+        state.isMenuOpen = !state.isMenuOpen;
+        uiLayer.style.display = state.isMenuOpen ? 'block' : 'none';
+    }
+
+    function checkUICollision(x, y) {
+        // 获取所有按钮
+        const buttons = document.querySelectorAll('.btn');
+        let hit = false;
+
+        buttons.forEach(btn => {
+            const rect = btn.getBoundingClientRect();
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+                hit = true;
+                // 选中逻辑
+                activateButton(btn);
+            }
+        });
+    }
+
+    function activateButton(btn) {
+        const type = btn.getAttribute('data-type');
+        const val = btn.getAttribute('data-val');
+
+        // 更新 UI 样式
+        const siblings = btn.parentElement.querySelectorAll('.btn');
+        siblings.forEach(s => s.classList.remove('active'));
+        btn.classList.add('active');
+
+        // 更新状态
+        if (type === 'tool') state.tool = val;
+        if (type === 'color') state.color = val;
+        if (type === 'size') state.lineWidth = parseInt(val);
+    }
+
+    // --- 绘图与特效 ---
+
+    function drawPaths(ctx) {
+        const centerX = canvasElement.width / 2;
+        const centerY = canvasElement.height / 2;
+
+        ctx.save();
+        // 应用缩放中心
+        ctx.translate(centerX, centerY);
+        ctx.scale(state.globalScale, state.globalScale);
+        ctx.translate(-centerX, -centerY);
+
+        // 绘制历史路径
+        for (const pathObj of paths) {
+            ctx.beginPath();
+            ctx.lineWidth = pathObj.width;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            
+            if (pathObj.isEraser) {
+                ctx.globalCompositeOperation = 'destination-out'; // 橡皮擦模式
+                ctx.strokeStyle = "rgba(0,0,0,1)";
+            } else {
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.strokeStyle = pathObj.color;
+            }
+
+            if (pathObj.points.length > 0) {
+                ctx.moveTo(pathObj.points[0].x, pathObj.points[0].y);
+                for (let i = 1; i < pathObj.points.length; i++) {
+                    ctx.lineTo(pathObj.points[i].x, pathObj.points[i].y);
+                }
+            }
+            ctx.stroke();
+        }
+
+        // 绘制当前正在写的路径
+        if (currentPath.length > 0) {
+            ctx.beginPath();
+            ctx.lineWidth = state.lineWidth;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            if (state.tool === 'eraser') {
+                 ctx.globalCompositeOperation = 'destination-out';
+                 ctx.strokeStyle = "rgba(0,0,0,1)";
+            } else {
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.strokeStyle = state.color;
+            }
+            ctx.moveTo(currentPath[0].x, currentPath[0].y);
+            for (let i = 1; i < currentPath.length; i++) {
+                ctx.lineTo(currentPath[i].x, currentPath[i].y);
+            }
+            ctx.stroke();
+        }
+
+        ctx.restore();
+        // 重置混合模式以免影响后续绘制
+        ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // --- 雪花特效逻辑 ---
+    
+    function triggerSnowEffect() {
+        if (paths.length === 0 && currentPath.length === 0) return;
+
+        // 将所有路径点转换为粒子
+        const centerX = canvasElement.width / 2;
+        const centerY = canvasElement.height / 2;
+
+        // 收集所有点
+        let allPoints = [];
+        
+        // 辅助函数：应用当前的缩放获取实际屏幕位置
+        const getScreenPos = (pt) => {
+            return {
+                x: (pt.x - centerX) * state.globalScale + centerX,
+                y: (pt.y - centerY) * state.globalScale + centerY
+            };
+        };
+
+        paths.forEach(p => {
+            if(!p.isEraser) { // 橡皮擦轨迹不变成雪花
+                p.points.forEach(pt => {
+                    // 只有一定概率生成粒子，防止过卡
+                    if(Math.random() > 0.5) { 
+                        const screenPt = getScreenPos(pt);
+                        allPoints.push({
+                            x: screenPt.x,
+                            y: screenPt.y,
+                            color: p.color,
+                            size: Math.random() * 3 + 1
+                        });
+                    }
+                });
+            }
+        });
+
+        // 正在写的也算
+        currentPath.forEach(pt => {
+             const screenPt = getScreenPos(pt);
+             allPoints.push({x: screenPt.x, y: screenPt.y, color: state.color, size: 2});
+        });
+
+        // 生成粒子对象
+        allPoints.forEach(pt => {
+            particles.push({
+                x: pt.x,
+                y: pt.y,
+                vx: (Math.random() - 0.5) * 2,
+                vy: Math.random() * 2 + 1, // 向下飘
+                life: 1.0,
+                color: pt.color,
+                size: pt.size
+            });
+        });
+
+        // 清空路径
+        paths = [];
+        currentPath = [];
+        // 重置缩放，否则新字会乱
+        state.globalScale = 1.0; 
+    }
+
+    function updateAndDrawParticles(ctx) {
+        if (particles.length === 0) return;
+
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            
+            // 更新物理
+            p.x += p.vx;
+            p.y += p.vy;
+            p.life -= 0.01; // 逐渐消失
+            
+            // 摆动效果
+            p.x += Math.sin(p.y * 0.05) * 0.5;
+
+            // 绘制
+            ctx.globalAlpha = p.life;
+            ctx.fillStyle = p.color;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 移除死掉的粒子
+            if (p.life <= 0) {
+                particles.splice(i, 1);
+            }
+        }
+        ctx.globalAlpha = 1.0;
+    }
+
+</script>
+</body>
+</html>
